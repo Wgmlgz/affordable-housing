@@ -15,12 +15,15 @@ import mimetypes
 import os
 import re
 import shutil
+import ssl
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from email.parser import BytesParser
+from email.policy import default
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +33,7 @@ ARCHIVE = ROOT / "archive"
 ARCHIVE.mkdir(exist_ok=True)
 MAX_IMAGES = 30
 USER_AGENT = "Mozilla/5.0 (compatible; CianArchive/1.0; +local-personal-use)"
+INSECURE_TLS_CONTEXT = ssl._create_unverified_context()
 
 
 class CollectionError(Exception):
@@ -42,11 +46,11 @@ def clean(text: str | None) -> str | None:
     return re.sub(r"\s+", " ", html.unescape(text)).strip() or None
 
 
-def fetch(url: str, binary: bool = False) -> tuple[bytes, str]:
+def fetch(url: str, binary: bool = False, timeout: int = 30) -> tuple[bytes, str]:
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"}
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=INSECURE_TLS_CONTEXT) as response:
             kind = response.headers.get_content_type()
             data = response.read(20_000_000 if binary else 8_000_000)
             return data, kind
@@ -68,7 +72,7 @@ def fetch_api_listing(listing_id: str) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30, context=INSECURE_TLS_CONTEXT) as response:
             decoded = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as error:
         raise CollectionError("structured API unavailable") from error
@@ -136,9 +140,114 @@ def image_urls(page: str, ld: list[dict]) -> list[str]:
     return unique[:MAX_IMAGES]
 
 
+def pasted_url(value: str) -> str:
+    """Extract a URL when a browser or chat app pasted a formatted link."""
+    value = html.unescape(value).strip()
+    # Some apps copy a link as Markdown: [label](https://example.test/path).
+    markdown = re.fullmatch(r"\[[^\]]*\]\((https?://[^\s)]+)\)", value)
+    if markdown:
+        return markdown.group(1)
+    # Also accept an angle-bracketed URL or a URL surrounded by explanatory text.
+    found = re.search(r"https?://[^\s<>\[\]()]+", value)
+    return found.group(0).rstrip(".,;:!?") if found else value
+
+
+def cian_valuation_report_url(offer: dict, listing_id: str) -> str | None:
+    """Build Cian's public valuation-report URL from a structured flat offer."""
+    geo = offer.get("geo") if isinstance(offer.get("geo"), dict) else {}
+    address = geo.get("userInput")
+    if isinstance(address, str):
+        address = re.sub(r"^Россия,\s*", "", address, flags=re.I)
+    params = {
+        "address": address,
+        "totalArea": offer.get("totalArea"),
+        "roomsCount": offer.get("roomsCount"),
+        "offerId": listing_id,
+        # Cian's calculator uses this value for an ordinary, non-ground floor.
+        "floor": "floorOther" if offer.get("floorNumber") else None,
+        "repairType": {
+            "euro": "repairTypeEuro",
+            "cosmetic": "repairTypeCosmetic",
+            "design": "repairTypeDesign",
+            "without": "repairTypeNo",
+        }.get(offer.get("repairType")),
+    }
+    required = ("address", "totalArea", "roomsCount")
+    if not all(params.get(name) is not None for name in required):
+        return None
+    return "https://www.cian.ru/kalkulator-nedvizhimosti/?" + urllib.parse.urlencode(
+        {name: value for name, value in params.items() if value is not None}
+    )
+
+
+def rub_amount(value: str) -> int | None:
+    """Turn Cian's compact Russian money text (for example, 28,2 млн ₽) into rubles."""
+    normalized = value.replace("\xa0", " ").replace(" ", "").replace(",", ".")
+    try:
+        amount = float(normalized)
+    except ValueError:
+        return None
+    return round(amount * 1_000_000) if amount > 0 else None
+
+
+def cian_valuation_from_page(page: str) -> int | None:
+    """Extract the calculator's estimate from public HTML or embedded page data."""
+    for pattern in (
+        r'"(?:cianEstimate|estimatedPrice|estimatePrice|valuationPrice)"\s*:\s*"?(\d{6,})',
+        r'(\d+(?:[,.]\d+)?)\s*(?:млн|миллион\w*)\s*₽?\s*(?:</[^>]+>\s*){0,4}Оценка\s+Циана',
+        r'Оценка\s+Циана(?:</[^>]+>|\s)*[^\d]{0,120}(\d+(?:[,.]\d+)?)\s*(?:млн|миллион\w*)',
+    ):
+        matched = re.search(pattern, page, re.I | re.S)
+        if not matched:
+            continue
+        value = matched.group(1)
+        return int(value) if value.isdigit() and len(value) >= 6 else rub_amount(value)
+    return None
+
+
+def fetch_cian_valuation(offer: dict, listing_id: str) -> dict | None:
+    report_url = cian_valuation_report_url(offer, listing_id)
+    if not report_url:
+        return None
+    valuation = {"report_url": report_url}
+    warning = None
+    try:
+        page, kind = fetch(report_url, timeout=15)
+        if "html" in kind:
+            estimated_price = cian_valuation_from_page(page.decode("utf-8", "replace"))
+            if estimated_price:
+                valuation["estimated_price_rub"] = estimated_price
+            else:
+                warning = "Cian's calculator did not expose an estimate in its public HTML."
+        else:
+            warning = "Cian's calculator did not return an HTML report."
+    except CollectionError as error:
+        warning = str(error)
+    if "estimated_price_rub" not in valuation and warning:
+        valuation["warning"] = warning
+    return valuation
+
+
+def form_fields(content_type: str, body: bytes) -> dict[str, list[str]]:
+    """Read either browser FormData or URL-encoded request fields."""
+    if content_type.lower().startswith("multipart/form-data"):
+        message = BytesParser(policy=default).parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body
+        )
+        fields: dict[str, list[str]] = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if part.get_content_disposition() == "form-data" and name:
+                fields.setdefault(name, []).append(part.get_content())
+        return fields
+    return urllib.parse.parse_qs(body.decode("utf-8", "replace"))
+
+
 def collect(url: str) -> dict:
-    parsed = urllib.parse.urlparse(url.strip())
-    if parsed.scheme not in ("http", "https") or not parsed.netloc.lower().endswith("cian.ru"):
+    url = pasted_url(url)
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or not (hostname == "cian.ru" or hostname.endswith(".cian.ru")):
         raise CollectionError("Please provide a http(s) URL on cian.ru.")
     listing_id = re.search(r"/(?:sale|rent)/flat/(\d+)", parsed.path)
     if not listing_id:
@@ -157,6 +266,7 @@ def collect(url: str) -> dict:
         address = ", ".join(str(part.get("title") or part.get("name")) for part in address_parts if isinstance(part, dict) and (part.get("title") or part.get("name"))) or None
         method, raw_offer = "Cian structured offer API", offer
         urls = [photo["fullUrl"] for photo in offer.get("photos", []) if isinstance(photo, dict) and isinstance(photo.get("fullUrl"), str)]
+        valuation = fetch_cian_valuation(offer, listing_id)
     except CollectionError as error:
         api_error = str(error)
         page_bytes, content_type = fetch(url)
@@ -177,6 +287,7 @@ def collect(url: str) -> dict:
             price = price_match.group(1) if price_match else None
         address, method, raw_offer = meta(page, "og:address"), "public HTML metadata + JSON-LD", None
         urls = image_urls(page, ld)
+        valuation = None
     data = {
         "id": listing_id, "url": url, "collected_at": datetime.now(timezone.utc).isoformat(),
         "title": title, "description": description, "price_rub": price,
@@ -184,6 +295,7 @@ def collect(url: str) -> dict:
         "collector": {"method": method, "warnings": []},
     }
     if raw_offer is not None: data["raw_offer"] = raw_offer
+    if valuation is not None: data["cian_valuation"] = valuation
     if api_error: data["collector"]["warnings"].append(api_error)
     if not title and not description:
         data["collector"]["warnings"].append("Page was reachable but exposed little public metadata.")
@@ -242,14 +354,15 @@ def listing_page(listing_id: str) -> str | None:
     if not file.is_file(): return None
     item = json.loads(file.read_text(encoding="utf-8"))
     escaped_id = html.escape(listing_id)
-    fields = [("ID", item.get("id")), ("Цена", f'{item.get("price_rub")} ₽' if item.get("price_rub") else None), ("Адрес", item.get("address")), ("Собрано", item.get("collected_at")), ("Источник", item.get("url"))]
+    valuation = item.get("cian_valuation") if isinstance(item.get("cian_valuation"), dict) else {}
+    fields = [("ID", item.get("id")), ("Цена", f'{item.get("price_rub")} ₽' if item.get("price_rub") else None), ("Оценка Циана", f'{valuation.get("estimated_price_rub")} ₽' if valuation.get("estimated_price_rub") else None), ("Адрес", item.get("address")), ("Собрано", item.get("collected_at")), ("Источник", item.get("url"))]
     facts = "".join(f"<dt>{html.escape(label)}</dt><dd>{html.escape(str(value))}</dd>" for label, value in fields if value)
     photos = "".join(f'<a href="/archive/{escaped_id}/{html.escape(photo["file"])}" target="_blank"><img src="/archive/{escaped_id}/{html.escape(photo["file"])}" alt="Фото объявления"></a>' for photo in item.get("images", []))
     raw = item.get("raw_offer", item)
     params = "".join(f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>" for key, value in flatten(raw))
     return f'''<!doctype html><meta charset="utf-8"><title>{html.escape(item.get("title") or listing_id)}</title><style>
 *{{box-sizing:border-box}}body{{max-width:1000px;margin:32px auto;padding:0 16px;font:16px Arial;color:#111;background:#fff}}a{{color:#111}}h1{{margin-bottom:6px}}dl{{display:grid;grid-template-columns:150px 1fr;border-top:1px solid #111;margin:24px 0}}dt,dd{{margin:0;padding:10px;border-bottom:1px solid #ddd}}dt{{font-weight:bold}}.description{{white-space:pre-wrap;line-height:1.45;max-width:760px}}.gallery{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:24px 0}}.gallery img{{width:100%;height:140px;object-fit:cover;display:block}}details{{margin:28px 0}}table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{text-align:left;vertical-align:top;padding:7px;border:1px solid #bbb;overflow-wrap:anywhere}}th{{width:36%;background:#f3f3f3}}</style>
-<a href="/">← Archive</a><h1>{html.escape(item.get("title") or "Listing")}</h1><a href="{html.escape(item["url"])}" target="_blank">Open original Cian listing</a> · <a href="/archive/{escaped_id}/listing.json" target="_blank">Raw JSON</a><dl>{facts}</dl>{f'<h2>Описание</h2><p class="description">{html.escape(item["description"])}</p>' if item.get("description") else ''}<h2>Фото ({len(item.get("images", []))})</h2><div class="gallery">{photos or '<p>Нет сохранённых фото.</p>'}</div><details><summary>Все параметры API ({len(flatten(raw))})</summary><table><thead><tr><th>Параметр</th><th>Значение</th></tr></thead><tbody>{params}</tbody></table></details>'''
+<a href="/">← Archive</a><h1>{html.escape(item.get("title") or "Listing")}</h1><a href="{html.escape(item["url"])}" target="_blank">Open original Cian listing</a>{f' · <a href="{html.escape(valuation["report_url"])}" target="_blank">Cian valuation report</a>' if valuation.get("report_url") else ''} · <a href="/archive/{escaped_id}/listing.json" target="_blank">Raw JSON</a><dl>{facts}</dl>{f'<p>{html.escape(valuation["warning"])}</p>' if valuation.get("warning") else ''}{f'<h2>Описание</h2><p class="description">{html.escape(item["description"])}</p>' if item.get("description") else ''}<h2>Фото ({len(item.get("images", []))})</h2><div class="gallery">{photos or '<p>Нет сохранённых фото.</p>'}</div><details><summary>Все параметры API ({len(flatten(raw))})</summary><table><thead><tr><th>Параметр</th><th>Значение</th></tr></thead><tbody>{params}</tbody></table></details>'''
 
 
 def comparison_data() -> list[dict]:
@@ -257,7 +370,8 @@ def comparison_data() -> list[dict]:
     for item in listings():
         flat = dict(flatten(item.get("raw_offer", item)))
         # Normalized archive fields are more useful names than their API equivalents.
-        flat.update({"archive.price_rub": str(item.get("price_rub") or ""), "archive.title": item.get("title") or "", "archive.address": item.get("address") or ""})
+        valuation = item.get("cian_valuation") if isinstance(item.get("cian_valuation"), dict) else {}
+        flat.update({"archive.price_rub": str(item.get("price_rub") or ""), "archive.cian_estimated_price_rub": str(valuation.get("estimated_price_rub") or ""), "archive.title": item.get("title") or "", "archive.address": item.get("address") or ""})
         data.append({"id": item["id"], "title": item.get("title") or "Listing", "url": item["url"], "image": item.get("images", [{}])[0].get("file"), "fields": flat})
     return data
 
@@ -312,7 +426,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
     def do_POST(self):
         if self.path != "/api/collect": return self.send_error(404)
-        length = int(self.headers.get("Content-Length", "0")); fields = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        length = int(self.headers.get("Content-Length", "0"))
+        fields = form_fields(self.headers.get("Content-Type", ""), self.rfile.read(length))
         try:
             item = collect(fields.get("url", [""])[0]); return self.send(200, json.dumps({"message": f"Saved {item['id']} with {len(item['images'])} images."}), "application/json")
         except CollectionError as error: return self.send(422, json.dumps({"error": str(error)}), "application/json")
