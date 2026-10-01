@@ -1,0 +1,136 @@
+{
+  "id": "334375318",
+  "url": "https://www.cian.ru/sale/flat/334375318/",
+  "collected_at": "2026-10-01T10:50:29.402416+00:00",
+  "title": "2-комн. квартира, 55.4 м²",
+  "description": "Код объекта: 2366292. СВОБОДНАЯ ПРОДАЖА КВАРТИРЫ ПО АДРЕСУ ул, ЗОРГЕ дом, 10 кор 2 !!! ХАРАКТЕРИСТИКА ОБЪЕКТА: • Полноценная двухкомнатная квартира по ЕГРН 55.4 кв.м, Сталинка. • Кухня 9.9 кв.м, две изолированные спальни 19.3 кв.м и 14.2 кв.м. • Планировка линейная, окна на ЖК Зорге 9. • Лифт есть пассажирский, балкона нет. • Высокие потолки 3 метра. • Квартира без отделки • Въезд во двор через шлагбаум. Квартира расположена в престижном районе. Вся инфраструктура в шаговой доступности. Транспортная доступность отличная м. Полежаевская и МЦК Хорошёво в шаговой доступности. Квартиру подготовили к отделке, снесли и демонтировали все старое. Правоустановка ДКП, без долгов и обременений, никто не прописан, собственник один.",
+  "price_rub": 23500000,
+  "address": "Москва, САО, р-н Хорошевский, ул. Зорге, 10к2",
+  "images": [
+    {
+      "file": "images/01.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758333-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/02.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758335-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/03.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758340-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/04.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758345-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/05.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758351-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/06.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758357-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/07.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758366-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/08.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758370-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/09.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758392-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/10.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758395-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/11.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758404-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/12.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758414-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/13.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758419-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/14.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758424-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/15.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758427-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/16.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758432-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/17.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758440-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/18.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758456-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/19.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758468-1.jpg",
+      "content_type": "image/webp"
+    },
+    {
+      "file": "images/20.webp",
+      "source_url": "https://images.cdn-cian.ru/images/2974758483-1.jpg",
+      "content_type": "image/webp"
+    }
+  ],
+  "collector": {
+    "method": "in-app browser visible Cian listing + pageAssets image bundle",
+    "warnings": [
+      "Structured Cian API returned HTTP 403; listing data transcribed from visible public page.",
+      "No raw_offer; Cian valuation result unavailable."
+    ]
+  },
+  "public_fields": {
+    "total_area_sqm": 55.4,
+    "living_area_sqm": 33.5,
+    "kitchen_area_sqm": 9.9,
+    "floor": 2,
+    "listing_building_floors": 6,
+    "listing_build_year_badge": 1956,
+    "building_section_build_year": 1955,
+    "ceiling_m": 3.0,
+    "bathroom": "separate",
+    "windows": "street",
+    "repair": "none",
+    "building_material": "brick",
+    "floors_material": "reinforced concrete",
+    "passenger_lifts": 1,
+    "sale_type": "free",
+    "mortgage_allowed": true
+  }
+}
