@@ -27,6 +27,7 @@ from email.policy import default
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from markdown_it import MarkdownIt
 
 ROOT = Path(__file__).resolve().parent
 ARCHIVE = ROOT / "archive"
@@ -294,6 +295,9 @@ def collect(url: str) -> dict:
         "address": address, "images": [],
         "collector": {"method": method, "warnings": []},
     }
+    coordinates = (raw_offer or {}).get("geo", {}).get("coordinates", {}) if isinstance(raw_offer, dict) else {}
+    if coordinates.get("lat") is not None and coordinates.get("lng") is not None:
+        data["location"] = {"lat": coordinates["lat"], "lng": coordinates["lng"], "source": "Cian structured offer"}
     if raw_offer is not None: data["raw_offer"] = raw_offer
     if valuation is not None: data["cian_valuation"] = valuation
     if api_error: data["collector"]["warnings"].append(api_error)
@@ -334,6 +338,72 @@ def listings() -> list[dict]:
     return sorted(result, key=lambda x: x.get("collected_at", ""), reverse=True)
 
 
+def listing_heading(item: dict) -> str:
+    title = str(item.get("title") or "Квартира")
+    address = str(item.get("address") or "").strip()
+    return f"{title} — {address}" if address and address not in title else title
+
+
+def research_html(listing_id: str) -> str:
+    path = ARCHIVE / listing_id / "research.md"
+    if not path.is_file():
+        return '<p>Исследование для этой квартиры пока не сохранено.</p>'
+    source = path.read_text(encoding="utf-8")
+    source = source.replace(str(ROOT) + "/archive/", "/archive/")
+    source = source.replace(str(ROOT) + "/README.md", "/methodology")
+    rendered = MarkdownIt("default", {"html": False}).enable("table").render(source)
+    return rendered.replace("<table>", '<div class="table-scroll"><table>').replace("</table>", "</table></div>")
+
+
+def assessment_rows(source: str) -> list[dict[str, str]]:
+    section = re.search(r"^## 10\. Оценка\s*\n(.*?)(?=^## |\Z)", source, re.M | re.S)
+    if not section:
+        return []
+    result = []
+    for line in section.group(1).splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 4 or cells[0] == "Параметр" or re.fullmatch(r"[:\- ]+", cells[0]):
+            continue
+        cells = [re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", cell).replace("**", "") for cell in cells]
+        result.append(dict(zip(("parameter", "score", "weight", "basis"), cells)))
+    return result
+
+
+def map_data() -> list[dict]:
+    result = []
+    for item in listings():
+        location = item.get("location") or (item.get("raw_offer") or {}).get("geo", {}).get("coordinates") or {}
+        if location.get("lat") is None or location.get("lng") is None:
+            continue
+        ident = str(item["id"])
+        research = ARCHIVE / ident / "research.md"
+        summary, score, assessment = "", None, []
+        if research.is_file():
+            content = research.read_text(encoding="utf-8")
+            assessment = assessment_rows(content)
+            section = re.search(r"## Вывод\s*(.*?)(?=\n## |\Z)", content, re.S)
+            if section:
+                conclusion = re.split(r"\s+\[(?:Объявление|Источник)\]\(", section.group(1), maxsplit=1)[0]
+                summary = re.sub(r"!?\[([^]]+)\]\([^)]+\)", r"\1", conclusion)
+                summary = re.sub(r"[*_#]", "", summary)
+                summary = re.sub(r"^\s*Оценка\s*[—–-]\s*\d+(?:[,.]\d+)?/10\.\s*", "", summary)
+                summary = re.sub(r"\s+", " ", summary).strip()[:420]
+            found = re.search(r"(?:Оценка|Итог)\s*[—–-]\s*(\d+(?:[,.]\d+)?)\s*/\s*10", content)
+            if found:
+                score = found.group(1)
+        images = item.get("images") or []
+        result.append({
+            "id": ident, "title": item.get("title") or "Квартира", "address": item.get("address") or "",
+            "price_rub": item.get("price_rub"), "lat": float(location["lat"]), "lng": float(location["lng"]),
+            "image": images[0].get("file") if images else None, "score": score, "summary": summary,
+            "assessment": assessment,
+            "url": item.get("url"), "has_research": research.is_file(),
+        })
+    return result
+
+
 def flatten(value, prefix="") -> list[tuple[str, str]]:
     """Turn the saved API structure into readable leaf parameters."""
     rows = []
@@ -353,6 +423,7 @@ def listing_page(listing_id: str) -> str | None:
     file = ARCHIVE / listing_id / "listing.json"
     if not file.is_file(): return None
     item = json.loads(file.read_text(encoding="utf-8"))
+    heading = html.escape(listing_heading(item))
     escaped_id = html.escape(listing_id)
     valuation = item.get("cian_valuation") if isinstance(item.get("cian_valuation"), dict) else {}
     fields = [("ID", item.get("id")), ("Цена", f'{item.get("price_rub")} ₽' if item.get("price_rub") else None), ("Оценка Циана", f'{valuation.get("estimated_price_rub")} ₽' if valuation.get("estimated_price_rub") else None), ("Адрес", item.get("address")), ("Собрано", item.get("collected_at")), ("Источник", item.get("url"))]
@@ -360,9 +431,9 @@ def listing_page(listing_id: str) -> str | None:
     photos = "".join(f'<a href="/archive/{escaped_id}/{html.escape(photo["file"])}" target="_blank"><img src="/archive/{escaped_id}/{html.escape(photo["file"])}" alt="Фото объявления"></a>' for photo in item.get("images", []))
     raw = item.get("raw_offer", item)
     params = "".join(f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>" for key, value in flatten(raw))
-    return f'''<!doctype html><meta charset="utf-8"><title>{html.escape(item.get("title") or listing_id)}</title><style>
-*{{box-sizing:border-box}}body{{max-width:1000px;margin:32px auto;padding:0 16px;font:16px Arial;color:#111;background:#fff}}a{{color:#111}}h1{{margin-bottom:6px}}dl{{display:grid;grid-template-columns:150px 1fr;border-top:1px solid #111;margin:24px 0}}dt,dd{{margin:0;padding:10px;border-bottom:1px solid #ddd}}dt{{font-weight:bold}}.description{{white-space:pre-wrap;line-height:1.45;max-width:760px}}.gallery{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:24px 0}}.gallery img{{width:100%;height:140px;object-fit:cover;display:block}}details{{margin:28px 0}}table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{text-align:left;vertical-align:top;padding:7px;border:1px solid #bbb;overflow-wrap:anywhere}}th{{width:36%;background:#f3f3f3}}</style>
-<a href="/">← Archive</a><h1>{html.escape(item.get("title") or "Listing")}</h1><a href="{html.escape(item["url"])}" target="_blank">Open original Cian listing</a>{f' · <a href="{html.escape(valuation["report_url"])}" target="_blank">Cian valuation report</a>' if valuation.get("report_url") else ''} · <a href="/archive/{escaped_id}/listing.json" target="_blank">Raw JSON</a><dl>{facts}</dl>{f'<p>{html.escape(valuation["warning"])}</p>' if valuation.get("warning") else ''}{f'<h2>Описание</h2><p class="description">{html.escape(item["description"])}</p>' if item.get("description") else ''}<h2>Фото ({len(item.get("images", []))})</h2><div class="gallery">{photos or '<p>Нет сохранённых фото.</p>'}</div><details><summary>Все параметры API ({len(flatten(raw))})</summary><table><thead><tr><th>Параметр</th><th>Значение</th></tr></thead><tbody>{params}</tbody></table></details>'''
+    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><title>{heading}</title><style>
+*{{box-sizing:border-box}}body{{max-width:1000px;margin:32px auto;padding:0 16px;font:16px Arial;color:#111;background:#fff}}a{{color:#111}}h1{{margin-bottom:6px}}dl{{display:grid;grid-template-columns:150px 1fr;border-top:1px solid #111;margin:24px 0}}dt,dd{{margin:0;padding:10px;border-bottom:1px solid #ddd}}dt{{font-weight:bold}}.description{{white-space:pre-wrap;line-height:1.45;max-width:760px}}.gallery{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:24px 0}}.gallery img{{width:100%;height:140px;object-fit:cover;display:block}}details{{margin:28px 0}}table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{text-align:left;vertical-align:top;padding:7px;border:1px solid #bbb;overflow-wrap:anywhere}}th{{background:#f3f3f3}}.api-params th{{width:36%}}.research{{border-top:2px solid #111;margin:36px 0;padding-top:8px;line-height:1.55;overflow-wrap:anywhere}}.research h1{{display:none}}.research h2{{margin-top:32px}}.research .table-scroll{{max-width:100%;overflow-x:auto;margin:16px 0}}.research .table-scroll table{{min-width:760px;width:100%;margin:0;font-size:14px}}.research .table-scroll th,.research .table-scroll td{{width:auto;overflow-wrap:normal;word-break:normal;line-height:1.4}}.research img{{max-width:100%;height:auto}}.research blockquote{{border-left:3px solid #bbb;margin-left:0;padding-left:16px;color:#444}}.research code{{white-space:pre-wrap}}@media(max-width:600px){{dl{{grid-template-columns:110px 1fr}}.research table{{font-size:12px}}}}</style>
+<a href="/">← Список</a> · <a href="/map?selected={escaped_id}">На карте</a><h1>{heading}</h1><a href="{html.escape(item["url"])}" target="_blank">Объявление Циан</a>{f' · <a href="{html.escape(valuation["report_url"])}" target="_blank">Оценка Циана</a>' if valuation.get("report_url") else ''} · <a href="/archive/{escaped_id}/listing.json" target="_blank">JSON</a> · <a href="#research">Исследование ↓</a><dl>{facts}</dl>{f'<p>{html.escape(valuation["warning"])}</p>' if valuation.get("warning") else ''}{f'<h2>Описание</h2><p class="description">{html.escape(item["description"])}</p>' if item.get("description") else ''}<h2>Фото ({len(item.get("images", []))})</h2><div class="gallery">{photos or '<p>Нет сохранённых фото.</p>'}</div><section id="research" class="research">{research_html(listing_id)}</section><details class="api-params"><summary>Все параметры API ({len(flatten(raw))})</summary><table><thead><tr><th>Параметр</th><th>Значение</th></tr></thead><tbody>{params}</tbody></table></details></html>'''
 
 
 def comparison_data() -> list[dict]:
@@ -372,7 +443,7 @@ def comparison_data() -> list[dict]:
         # Normalized archive fields are more useful names than their API equivalents.
         valuation = item.get("cian_valuation") if isinstance(item.get("cian_valuation"), dict) else {}
         flat.update({"archive.price_rub": str(item.get("price_rub") or ""), "archive.cian_estimated_price_rub": str(valuation.get("estimated_price_rub") or ""), "archive.title": item.get("title") or "", "archive.address": item.get("address") or ""})
-        data.append({"id": item["id"], "title": item.get("title") or "Listing", "url": item["url"], "image": item.get("images", [{}])[0].get("file"), "fields": flat})
+        data.append({"id": item["id"], "title": listing_heading(item), "url": item["url"], "image": item.get("images", [{}])[0].get("file"), "fields": flat})
     return data
 
 
@@ -393,16 +464,48 @@ function calculate(){let st=state();localStorage.setItem(key,JSON.stringify(st))
 async function init(){data=await (await fetch('/api/comparison-data')).json();let fields=new Set;data.forEach(x=>Object.entries(x.fields).forEach(([k,v])=>{if(v!==''&&Number.isFinite(parseFloat(v))&&String(parseFloat(v))===String(v).trim())fields.add(k)}));numeric=[...fields].sort();let saved;try{saved=JSON.parse(localStorage.getItem(key))}catch{};(saved?.filters||[]).forEach(x=>row('filter',x));(saved?.metrics||[{field:'archive.price_rub',weight:1,direction:'low'}]).forEach(x=>row('metric',x));calculate()};$('#addFilter').onclick=()=>{row('filter');calculate()};$('#addMetric').onclick=()=>{row('metric');calculate()};$('#filters').addEventListener('input',calculate);$('#filters').addEventListener('change',calculate);$('#metrics').addEventListener('input',calculate);$('#metrics').addEventListener('change',calculate);$('#calculate').onclick=calculate;$('#reset').onclick=()=>{localStorage.removeItem(key);location.reload()};init();</script>'''
 
 
+def map_page() -> str:
+    return '''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Карта квартир</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""><style>
+*{box-sizing:border-box}body{margin:0;font:16px Arial,sans-serif;color:#171717;background:#fff}header{padding:13px 20px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #ddd}a{color:#171717}header h1{font-size:19px;margin:0}.layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(480px,44vw);height:calc(100vh - 54px)}#map{min-height:400px}.card{padding:20px;overflow:auto;border-left:1px solid #ddd}.card-top{display:flex;gap:12px;align-items:flex-start}.card-top img{width:112px;height:94px;flex:none;object-fit:cover;border-radius:5px;background:#eee}.card h2{font-size:18px;line-height:1.25;margin:0 0 7px}.card h3{font-size:17px;margin:22px 0 8px}.address{color:#555;line-height:1.4}.price{font-size:21px;font-weight:bold;margin:12px 0}.score{display:inline-block;background:#e8f5ed;border-radius:4px;padding:6px 9px}.summary{line-height:1.5;color:#333;margin:0}.assessment{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px;line-height:1.35}.assessment th,.assessment td{border:1px solid #ccc;padding:6px;text-align:left;vertical-align:top;overflow-wrap:break-word}.assessment th{background:#f4f4f4}.assessment th:first-child{width:115px}.assessment th:nth-child(2){width:64px}.assessment th:nth-child(3){width:42px}.assessment td:nth-child(2),.assessment td:nth-child(3){text-align:right;white-space:nowrap}.links{display:flex;gap:14px;flex-wrap:wrap;margin-top:20px}.muted{color:#777}.leaflet-container{font:inherit}@media(max-width:750px){.layout{display:flex;flex-direction:column;height:auto}#map{height:52vh;min-height:350px}.card{border-left:0;border-top:1px solid #ddd;min-height:320px}}
+</style></head><body><header><a href="/">← Список</a><h1>Карта квартир</h1></header><main class="layout"><div id="map" role="application" aria-label="Карта активных квартир"></div><aside class="card" id="card"><p class="muted">Выберите квартиру на карте.</p></aside></main><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script><script>
+const card=document.querySelector('#card');
+function add(tag,text,parent=card,className=''){const el=document.createElement(tag);el.textContent=text; if(className)el.className=className;parent.append(el);return el}
+function link(text,url,parent=card){const a=add('a',text,parent);a.href=url;return a}
+function show(item,marker){
+  card.replaceChildren();
+  const top=add('div','',card,'card-top');
+  if(item.image){const img=document.createElement('img');img.src='/archive/'+encodeURIComponent(item.id)+'/'+item.image.split('/').map(encodeURIComponent).join('/');img.alt='Фото квартиры';top.append(img)}
+  const info=add('div','',top);add('h2',item.title,info);add('p',item.address,info,'address');
+  if(item.price_rub)add('p',new Intl.NumberFormat('ru-RU').format(item.price_rub)+' ₽',card,'price');
+  if(item.score)add('span','Оценка: '+item.score+'/10',card,'score');
+  if(item.summary){add('h3','Вывод');add('p',item.summary,card,'summary')}
+  if(item.assessment?.length){
+    add('h3','10. Оценка');
+    const table=document.createElement('table');table.className='assessment';card.append(table);
+    const head=document.createElement('thead');const headers=document.createElement('tr');head.append(headers);table.append(head);
+    for(const label of ['Параметр','Балл /10','Вес','Основание'])add('th',label,headers);
+    const body=document.createElement('tbody');table.append(body);
+    for(const row of item.assessment){const tr=document.createElement('tr');body.append(tr);for(const key of ['parameter','score','weight','basis'])add('td',row[key],tr)}
+  }
+  const links=add('div','',card,'links');link('Открыть квартиру и исследование →','/listing/'+encodeURIComponent(item.id),links);if(item.has_research)link('К исследованию','/listing/'+encodeURIComponent(item.id)+'#research',links);if(item.url)link('Циан ↗',item.url,links);
+  if(marker)marker.setStyle({fillColor:'#d33',color:'#a22'});
+  history.replaceState(null,'','/map?selected='+encodeURIComponent(item.id));
+}
+async function init(){let data;try{const response=await fetch('/api/map-data');if(!response.ok)throw Error('HTTP '+response.status);data=await response.json()}catch(error){card.textContent='Не удалось загрузить квартиры: '+error.message;return}if(!window.L){card.textContent='Не удалось загрузить карту. Проверьте подключение к интернету.';return}const map=L.map('map').setView([55.8,37.52],12);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}).addTo(map);const points=[];const markers=new Map();for(const item of data){const marker=L.circleMarker([item.lat,item.lng],{radius:9,color:'#205a84',weight:2,fillColor:'#2886bd',fillOpacity:.9}).addTo(map);marker.bindTooltip(item.address||item.title);marker.on('click',()=>{for(const m of markers.values())m.setStyle({fillColor:'#2886bd',color:'#205a84'});show(item,marker)});markers.set(item.id,marker);points.push([item.lat,item.lng])}if(points.length)map.fitBounds(points,{padding:[35,35],maxZoom:13});else card.textContent='Нет квартир с координатами.';const selected=new URLSearchParams(location.search).get('selected');const initial=data.find(x=>x.id===selected)||data[0];if(initial){show(initial,markers.get(initial.id));if(selected)map.panTo([initial.lat,initial.lng])}}
+init();
+</script></body></html>'''
+
+
 def page() -> str:
     cards = []
     for item in listings():
         ident = html.escape(str(item["id"]))
         image = item.get("images", [{}])[0].get("file") if item.get("images") else None
         preview = f'<img src="/archive/{ident}/{html.escape(image)}" alt="" />' if image else '<div class="empty">no image</div>'
-        cards.append(f'<article>{preview}<div><h2>{html.escape(item.get("title") or "Untitled listing")}</h2><p>{html.escape(str(item.get("price_rub") or "Price unavailable"))} ₽</p><a href="/listing/{ident}">View details</a> · <a href="/archive/{ident}/listing.json" target="_blank">JSON</a> · <a href="{html.escape(item["url"])}" target="_blank">Cian</a> <button data-id="{ident}">Delete</button></div></article>')
+        cards.append(f'<article>{preview}<div><h2>{html.escape(listing_heading(item))}</h2><p>{html.escape(str(item.get("price_rub") or "Price unavailable"))} ₽</p><a href="/listing/{ident}">View details</a> · <a href="/archive/{ident}/listing.json" target="_blank">JSON</a> · <a href="{html.escape(item["url"])}" target="_blank">Cian</a> <button data-id="{ident}">Delete</button></div></article>')
     return f'''<!doctype html><meta charset="utf-8"><title>Cian archive</title><style>
 *{{box-sizing:border-box}} body{{max-width:840px;margin:40px auto;padding:0 16px;font:16px Arial;color:#111;background:#fff}} input,button{{font:inherit;border:1px solid #111;background:#fff;padding:10px}} input{{width:min(580px,100%)}} button{{cursor:pointer}} form{{display:flex;gap:8px;flex-wrap:wrap}} #status{{min-height:24px;margin:14px 0}} article{{border-top:1px solid #111;padding:16px 0;display:flex;gap:16px}} img,.empty{{width:150px;height:100px;object-fit:cover;background:#eee;flex:none}} .empty{{display:grid;place-items:center;color:#555}} h2{{font-size:17px;margin:0 0 8px}} p{{margin:0 0 8px}} a{{color:#111}} </style>
-<h1>Cian archive</h1><p><a href="/compare">Compare saved listings →</a></p><form id="import"><input name="url" required placeholder="https://www.cian.ru/sale/flat/332630276"><button>Collect</button></form><div id="status"></div><section>{''.join(cards) or '<p>No saved listings yet.</p>'}</section>
+<h1>Cian archive</h1><p><a href="/map">Карта квартир →</a> · <a href="/compare">Сравнить объявления →</a></p><form id="import"><input name="url" required placeholder="https://www.cian.ru/sale/flat/332630276"><button>Collect</button></form><div id="status"></div><section>{''.join(cards) or '<p>No saved listings yet.</p>'}</section>
 <script>const s=document.querySelector('#status');document.querySelector('#import').onsubmit=async e=>{{e.preventDefault();s.textContent='Collecting…';let r=await fetch('/api/collect',{{method:'POST',body:new FormData(e.target)}});let x=await r.json();s.textContent=x.message||x.error; if(r.ok)setTimeout(()=>location.reload(),500)}};document.querySelectorAll('button[data-id]').forEach(b=>b.onclick=async()=>{{if(confirm('Delete this archive?')){{await fetch('/api/listings/'+b.dataset.id,{{method:'DELETE'}});location.reload()}}}})</script>'''
 
 
@@ -412,14 +515,19 @@ class Handler(BaseHTTPRequestHandler):
         raw = body.encode() if isinstance(body, str) else body
         self.send_response(status); self.send_header("Content-Type", kind); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
     def do_GET(self):
-        if self.path == "/": return self.send(200, page())
-        if self.path == "/compare": return self.send(200, comparison_page())
-        if self.path == "/api/comparison-data": return self.send(200, json.dumps(comparison_data(), ensure_ascii=False), "application/json")
-        matched = re.fullmatch(r"/listing/(\d+)", self.path)
+        parsed = urllib.parse.urlparse(self.path)
+        route = parsed.path
+        if route == "/": return self.send(200, page())
+        if route == "/compare": return self.send(200, comparison_page())
+        if route == "/map": return self.send(200, map_page())
+        if route == "/methodology": return self.send(200, MarkdownIt("default", {"html": False}).enable("table").render((ROOT / "README.md").read_text(encoding="utf-8")))
+        if route == "/api/comparison-data": return self.send(200, json.dumps(comparison_data(), ensure_ascii=False), "application/json")
+        if route == "/api/map-data": return self.send(200, json.dumps(map_data(), ensure_ascii=False), "application/json")
+        matched = re.fullmatch(r"/listing/(\d+)", route)
         if matched:
             content = listing_page(matched.group(1))
             return self.send(200, content) if content else self.send_error(404)
-        path = (ROOT / urllib.parse.unquote(self.path.lstrip("/"))).resolve()
+        path = (ROOT / urllib.parse.unquote(route.lstrip("/"))).resolve()
         if str(path).startswith(str(ARCHIVE.resolve())) and path.is_file():
             kind = "application/json" if path.suffix == ".json" else (mimetypes.guess_type(path.name)[0] or "application/octet-stream")
             return self.send(200, path.read_bytes(), kind)
